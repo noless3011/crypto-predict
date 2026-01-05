@@ -257,9 +257,9 @@ if __name__ == "__main__":
         print(df.isnull().sum()[df.isnull().sum() > 0])
 
         # 2. Visualizations
-        plot_technical_dashboard(df)  # Visual check of time-series
-        plot_target_analysis(df)  # Check if classes are balanced
-        plot_correlation_heatmap(df)  # Check for multicollinearity
+        # plot_technical_dashboard(df)  # Visual check of time-series
+        # plot_target_analysis(df)  # Check if classes are balanced
+        # plot_correlation_heatmap(df)  # Check for multicollinearity
         plot_all_distributions(df)  # Check for stationarity/outliers
     else:
         print("DataFrame is empty. Please check the CSV file path.")

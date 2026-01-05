@@ -1,333 +1,271 @@
+import math
 import os
+import time
+import warnings
+from datetime import datetime
 from enum import Enum
-from typing import List, Optional
 
+import clickhouse_connect
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# Assuming df_clean exists in your project directory
-try:
-    from df_clean import process_ticker
-except ImportError:
-    print("Warning: df_clean module not found. Please ensure it exists.")
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+pd.set_option("future.no_silent_downcasting", True)
 
-    def process_ticker(ticker, verbose=False):
-        return None
+# ==========================================
+# 1. SETUP & CONFIGURATION
+# ==========================================
+# --- PARTITION CONFIGURATION ---
+PART_ID = 2  # 0 = Test Mode (2 tickers). 1 to TOTAL_PARTS = Actual Data Split.
+TOTAL_PARTS = 8  # Split the 670 tickers into this many chunks to fit Kaggle 20GB limit.
 
+OUTPUT_DIR = "/kaggle/working/processed_data"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- CONFIGURATION ---
-WINDOW_SIZE = 60
-PREDICT_STEPS = 1
+TICKER_CSV_PATH = "/kaggle/input/tickers/ticker.csv"
 
-
-class FeatureType(str, Enum):
-    PRICE = "price"  # Returns, Ranges (No raw prices)
-    VOLUME = "volume"  # Log-transformed volume features
-    ORDER_FLOW = "order_flow"
-    TECHNICAL = "technical"  # RSI, Normalized MACD, BB Position
-    MOMENTUM = "momentum"
-    VOLUME_PRICE = "volume_price"
-    MICROSTRUCTURE = "microstructure"
-    TIME = "time"
-    STATISTICAL = "statistical"  # Skew, Kurtosis
-
-
-# --- HELPER: DATA CLEANING ---
-def ensure_numeric_data(df):
-    """Ensures basic OHLCV columns are numeric floats."""
-    cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quoteAssetVolume",
-        "numOfTrades",
-        "takerBuyBaseAssetVolume",
-    ]
-
-    existing_cols = [c for c in cols if c in df.columns]
-    for c in existing_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+# Database Connection
+client = clickhouse_connect.get_client(
+    host="128.199.197.160",
+    port=32014,
+    username="readonly_user",
+    password="grA5SfKxOQ",
+    database="default",
+)
 
 
-def clean_infinite_values(df):
-    """Replaces infinity with NaN to prevent model crashes."""
-    return df.replace([np.inf, -np.inf], np.nan)
+# ==========================================
+# 2. FEATURE ENGINEERING LOGIC
+# ==========================================
+def _calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 
-# --- FEATURE FUNCTIONS ---
-def calculate_price_features(df):
-    """Stationary price-based features (Returns & Ranges)"""
-    # Normalized High-Low Range (Volatility proxy)
-    df["hl_range_pct"] = (df["high"] - df["low"]) / df["close"]
-
-    # Close-Open Return (Intraday momentum)
-    df["co_return"] = (df["close"] - df["open"]) / df["open"]
-
-    for window in [12, 36, 144]:
-        # Rolling Mean/Std of RETURNS (not prices)
-        df[f"rolling_mean_return_{window}"] = (
-            df["log_return"].rolling(window=window).mean()
-        )
-        df[f"rolling_volatility_{window}"] = (
-            df["log_return"].rolling(window=window).std()
-        )
-
-    return df
+def _calculate_parkinson_volatility(
+    high: pd.Series, low: pd.Series, window: int = 20
+) -> pd.Series:
+    const = 1.0 / (4.0 * np.log(2.0))
+    log_hl = np.log(high / low) ** 2
+    return np.sqrt(const * log_hl.rolling(window=window).mean())
 
 
-def calculate_volume_features(df):
-    """Volume features (Log-transformed to fix skew)"""
-    # Log transform is crucial for Volume to squash outliers
-    df["volume_log"] = np.log1p(df["volume"])
+def add_features_and_clean(
+    df: pd.DataFrame, news_df: pd.DataFrame = None
+) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-    # Volume Change (Stationary)
-    df["volume_pct_change"] = df["volume"].pct_change()
+    # Sort and Time Setup
+    df = df.sort_values("openTime").reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["openTime"], unit="ms")
 
-    # Relative Volume (Z-Score like)
-    vol_mean = df["volume"].rolling(window=144).mean()
-    df["volume_rel_ratio"] = df["volume"] / (vol_mean + 1e-8)
+    # --- A. Technical Features ---
+    # 1. Log Returns
+    for n in [1, 3, 6, 12, 24]:
+        df[f"log_ret_{n}"] = np.log(df["close"] / df["close"].shift(n))
 
-    return df
+    # 2. Rolling Z-Score (Normalization)
+    window_z = 100
+    r_mean = df["close"].rolling(window=window_z).mean()
+    r_std = df["close"].rolling(window=window_z).std()
+    df["price_zscore"] = (df["close"] - r_mean) / (r_std + 1e-8)
 
+    # 3. Volume / Liquidity
+    df["log_volume"] = np.log(df["volume"] + 1)
+    df["rvol"] = df["volume"] / (df["volume"].rolling(50).mean() + 1e-8)
 
-def calculate_order_flow_features(df):
-    """Order flow ratios"""
-    # Taker Buy Ratio (Buying Pressure) - naturally bounded 0-1
-    df["taker_buy_ratio"] = df["takerBuyBaseAssetVolume"] / (
-        df["quoteAssetVolume"] + 1e-8
+    # VWAP Distance
+    # Note: Using Typical Price * Volume approximation since quoteAssetVolume is removed
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    vwap = (tp * df["volume"]).rolling(288).sum() / (
+        df["volume"].rolling(288).sum() + 1e-8
     )
-    return df
+    df["dist_vwap"] = (df["close"] - vwap) / vwap
 
+    # 4. Volatility & Shadows
+    df["vol_parkinson"] = _calculate_parkinson_volatility(df["high"], df["low"])
+    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["upper_shadow"] = (df["high"] - df[["open", "close"]].max(axis=1)) / candle_range
+    df["lower_shadow"] = (df[["open", "close"]].min(axis=1) - df["low"]) / candle_range
 
-def calculate_technical_indicators(df):
-    """RSI, Normalized MACD, Bollinger Position"""
-    # RSI (Bounded 0-100)
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-8)
-    df["rsi_14"] = 100 - (100 / (1 + rs))
-    # Normalize RSI to 0-1 for Neural Networks
-    df["rsi_14"] = df["rsi_14"] / 100.0
+    # 5. Oscillators
+    df["rsi_14"] = _calculate_rsi(df["close"], 14) / 100.0
 
-    # NORMALIZED MACD (Crucial fix: Divide by Close to make it stationary)
-    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd_raw = ema_12 - ema_26
-    df["macd_pct"] = macd_raw / df["close"]  # Now it's a percentage
+    # 6. Time Embeddings (24/7 Crypto market = 1440 mins)
+    minutes = df["datetime"].dt.hour * 60 + df["datetime"].dt.minute
+    df["time_sin"] = np.sin(2 * np.pi * minutes / 1440)
+    df["time_cos"] = np.cos(2 * np.pi * minutes / 1440)
 
-    # Signal line on the normalized MACD
-    df["macd_signal_pct"] = df["macd_pct"].ewm(span=9, adjust=False).mean()
-    df["macd_hist_pct"] = df["macd_pct"] - df["macd_signal_pct"]
+    # --- B. Merge News Sentiment ---
+    if news_df is not None and not news_df.empty:
+        df = pd.merge_asof(
+            df,
+            news_df,
+            left_on="datetime",
+            right_on="datetime",
+            direction="backward",
+            tolerance=pd.Timedelta("4h"),
+        )
+        df["global_sentiment_score"] = df["global_sentiment_score"].fillna(0)
+        df["global_sentiment_ewma"] = df["global_sentiment_ewma"].fillna(0)
 
-    # Bollinger Band Position (Bounded 0-1 approx)
-    for window in [20, 60]:
-        rolling_mean = df["close"].rolling(window=window).mean()
-        rolling_std = df["close"].rolling(window=window).std()
+    # --- C. Cleanup ---
+    # Dropping columns that are no longer needed
+    cols_to_drop = ["closeTime", "numOfTrades", "expected_openTime", "tp"]
+    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors="ignore")
 
-        # (Price - Lower) / (Upper - Lower)
-        upper = rolling_mean + (2 * rolling_std)
-        lower = rolling_mean - (2 * rolling_std)
-        df[f"bb_position_{window}"] = (df["close"] - lower) / ((upper - lower) + 1e-8)
-
-    return df
-
-
-def calculate_momentum_features(df):
-    """Momentum based on returns, not raw prices"""
-    # ROC (Rate of Change)
-    for period in [12, 36, 144]:
-        df[f"roc_{period}"] = df["close"].pct_change(period)
-
-    # Price position relative to MA (Percentage)
-    for window in [12, 36, 144]:
-        ma = df["close"].rolling(window=window).mean()
-        df[f"dist_to_ma_{window}"] = (df["close"] - ma) / (ma + 1e-8)
+    # Drop rows with NaNs caused by lagging
+    df = df.dropna().reset_index(drop=True)
 
     return df
 
 
-def calculate_volume_price_features(df):
-    """Volume-Weighted features"""
-    # VWAP Deviation
-    for window in [12, 36]:
-        typical_price = (df["high"] + df["low"] + df["close"]) / 3
-        vol_sum = df["volume"].rolling(window=window).sum() + 1e-8
-        vp_sum = (typical_price * df["volume"]).rolling(window=window).sum()
-        vwap = vp_sum / vol_sum
-
-        # Percentage distance from VWAP
-        df[f"vwap_dev_{window}"] = (df["close"] - vwap) / (vwap + 1e-8)
-
-    return df
-
-
-def calculate_microstructure_features(df):
-    """Liquidity and Trade Count (Log transformed)"""
-    # Log of Trade Count
-    df["trades_log"] = np.log1p(df["numOfTrades"])
-
-    # Average Trade Size (Quote Volume / Trades)
-    avg_trade_val = df["quoteAssetVolume"] / (df["numOfTrades"] + 1e-8)
-    df["avg_trade_val_log"] = np.log1p(avg_trade_val)
-
-    return df
-
-
-def calculate_time_features(df):
-    """Cyclical time encoding (Sine/Cosine)"""
-    if not np.issubdtype(df["openTime"].dtype, np.datetime64):
-        # Assuming ms timestamp if not datetime
-        df["datetime"] = pd.to_datetime(df["openTime"], unit="ms")
-    else:
-        df["datetime"] = df["openTime"]
-
-    # Normalize Time to -1 to 1
-    df["hour_sin"] = np.sin(2 * np.pi * df["datetime"].dt.hour / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["datetime"].dt.hour / 24)
-
-    df["day_sin"] = np.sin(2 * np.pi * df["datetime"].dt.dayofweek / 7)
-    df["day_cos"] = np.cos(2 * np.pi * df["datetime"].dt.dayofweek / 7)
-
-    df.drop(columns=["datetime"], inplace=True)
-    return df
-
-
-def calculate_statistical_features(df):
-    """Higher order moments"""
-    for window in [36]:
-        df[f"return_skew_{window}"] = df["log_return"].rolling(window=window).skew()
-        # Kurtosis often has huge outliers, consider clipping or log
-        df[f"return_kurt_{window}"] = df["log_return"].rolling(window=window).kurt()
-
-    return df
-
-
-# --- HELPER: CONTEXT LOADING ---
-def load_btc_context() -> Optional[pd.DataFrame]:
-    """Loads BTC returns to use as a global market factor."""
+# ==========================================
+# 3. NEWS PROCESSING (Global Sentiment)
+# ==========================================
+def process_global_news():
+    print("Fetching and processing Global News...")
+    query = "SELECT publishedOn, sentiment FROM news ORDER BY publishedOn"
     try:
-        btc_df = process_ticker("BTCUSDT", verbose=False)
-        if btc_df is not None and not btc_df.empty:
-            btc_df = ensure_numeric_data(btc_df)
-            # Only need log return for correlation context
-            btc_df["btc_log_return"] = np.log(
-                btc_df["close"] / btc_df["close"].shift(1)
-            )
+        result = client.query(query)
+        news_df = pd.DataFrame(result.result_rows, columns=result.column_names)
 
-            return btc_df[["openTime", "btc_log_return"]]
+        news_df["datetime"] = pd.to_datetime(news_df["publishedOn"], unit="s")
+        sentiment_map = {"POSITIVE": 1, "NEUTRAL": 0, "NEGATIVE": -1}
+        news_df["val"] = news_df["sentiment"].map(sentiment_map).fillna(0)
+
+        global_news = (
+            news_df.set_index("datetime").resample("5min")["val"].mean().reset_index()
+        )
+        global_news["global_sentiment_ewma"] = global_news["val"].ewm(span=12).mean()
+        global_news.rename(columns={"val": "global_sentiment_score"}, inplace=True)
+
+        print(f"Processed {len(global_news)} global news intervals.")
+        return global_news
     except Exception as e:
-        print(f"Could not load BTC context: {e}")
-    return None
-
-
-# --- MAIN GENERATOR ---
-def generate_features(
-    ticker: str,
-    selected_features: Optional[List[FeatureType]] = None,
-    btc_context: Optional[pd.DataFrame] = None,
-):
-    if selected_features is None:
-        selected_features = list(FeatureType)
-
-    # 1. Load Data
-    df = process_ticker(ticker, verbose=False)
-    if df is None or df.empty:
+        print(f"Warning: Could not fetch/process news. {e}")
         return pd.DataFrame()
 
-    # 2. Basic Preprocessing
-    df = ensure_numeric_data(df)
-    # Global Log Return (Essential for stationarity)
-    df["log_return"] = np.log(df["close"] / df["close"].shift(1))
 
-    # 3. Feature Engineering
-    if FeatureType.PRICE in selected_features:
-        df = calculate_price_features(df)
-    if FeatureType.VOLUME in selected_features:
-        df = calculate_volume_features(df)
-    if FeatureType.ORDER_FLOW in selected_features:
-        df = calculate_order_flow_features(df)
-    if FeatureType.TECHNICAL in selected_features:
-        df = calculate_technical_indicators(df)
-    if FeatureType.MOMENTUM in selected_features:
-        df = calculate_momentum_features(df)
-    if FeatureType.VOLUME_PRICE in selected_features:
-        df = calculate_volume_price_features(df)
-    if FeatureType.MICROSTRUCTURE in selected_features:
-        df = calculate_microstructure_features(df)
-    if FeatureType.TIME in selected_features:
-        df = calculate_time_features(df)
-    if FeatureType.STATISTICAL in selected_features:
-        df = calculate_statistical_features(df)
+# ==========================================
+# 4. DATA FETCHING (Optimized & Pruned)
+# ==========================================
+def get_clean_ticker_data(ticker_name: str, verbose=False, max_retries=5):
+    conditions = [f"ticker = '{ticker_name}'"]
 
-    # 4. Merge BTC Context
-    if btc_context is not None:
-        if df["openTime"].dtype != btc_context["openTime"].dtype:
-            df["openTime"] = df["openTime"].astype(btc_context["openTime"].dtype)
-        df = df.merge(btc_context, on="openTime", how="left")
-        df["btc_log_return"] = df["btc_log_return"].fillna(0)
+    query = f"""
+    SELECT openTime, open, high, low, close, volume, closeTime, numOfTrades
+    FROM future_kline_5m
+    WHERE {" AND ".join(conditions)}
+    ORDER BY openTime
+    """
 
-    # 5. Create Targets
-    # Regression Target
-    df["TARGET_next_return"] = df["log_return"].shift(-PREDICT_STEPS)
-    # Classification Target (1 if up, 0 if down) - Often easier for LSTM
-    df["TARGET_class"] = (df["TARGET_next_return"] > 0).astype(int)
+    attempt = 0
+    base_wait_seconds = 300  # 5 minutes
 
-    # 6. Cleaning & Filtering
-    df = clean_infinite_values(df)
-    df = df.dropna()
+    while attempt <= max_retries:
+        try:
+            # Execute Query
+            result = client.query(query)
+            df = pd.DataFrame(result.result_rows, columns=result.column_names)
 
-    # 7. DROP RAW COLUMNS (Critical for LSTM Stationarity)
-    # We remove the non-stationary raw price/volume columns
-    raw_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quoteAssetVolume",
-        "numOfTrades",
-        "takerBuyBaseAssetVolume",
-        "openTime",
-        "closeTime",
-        "ignore",
-    ]
-    # Keep only columns that are NOT in raw_cols
-    final_cols = [c for c in df.columns if c not in raw_cols]
+            if df.empty:
+                return pd.DataFrame()
 
-    # Ensure targets are at the end for easier splitting
-    final_cols = [c for c in final_cols if "TARGET" not in c] + [
-        c for c in df.columns if "TARGET" in c
-    ]
+            # --- Data Cleaning ---
+            cols = ["open", "high", "low", "close", "volume", "numOfTrades"]
+            df[cols] = df[cols].apply(pd.to_numeric, errors="coerce")
 
-    return df[final_cols]
+            # Forward Fill
+            df = df.replace(0, np.nan).ffill().fillna(0)
+
+            return df
+
+        except Exception as e:
+            attempt += 1
+            if attempt > max_retries:
+                print(
+                    f"❌ Failed to fetch {ticker_name} after {max_retries} attempts. Error: {e}"
+                )
+                return pd.DataFrame()
+
+            # Calculate wait time: 5m, 10m, 15m...
+            wait_time = base_wait_seconds * attempt
+            print(f"⚠️ Query failed for {ticker_name}. Error: {e}")
+            print(
+                f"   Pausing for {wait_time / 60:.0f} minutes before retry {attempt}/{max_retries}..."
+            )
+            time.sleep(wait_time)
 
 
+# ==========================================
+# 5. MAIN EXECUTION LOOP
+# ==========================================
 if __name__ == "__main__":
-    print("Loading BTC Context...")
-    btc_ctx = load_btc_context()
+    # 1. Load Tickers
+    if not os.path.exists(TICKER_CSV_PATH):
+        print(f"Error: {TICKER_CSV_PATH} not found.")
+        exit()
 
-    ticker = "BTCUSDT"
-    print(f"Processing {ticker}...")
+    ticker_df = pd.read_csv(TICKER_CSV_PATH)
+    all_tickers = ticker_df["ticker"].astype(str).unique().tolist()
+    all_tickers.sort()  # Ensure deterministic order for partitioning
 
-    # Using ALL features for demonstration
-    result_df = generate_features(ticker, btc_context=btc_ctx)
+    total_tickers = len(all_tickers)
+    print(f"Total Tickers found: {total_tickers}")
 
-    print(f"\nProcessing Complete. Final Shape: {result_df.shape}")
-    if not result_df.empty:
-        print("\nFirst 5 rows (Stationary Features Only):")
-        print(result_df.head())
-        print("\nColumns retained:")
-        print(result_df.columns.tolist())
+    # 2. Partition Logic
+    tickers_to_process = []
 
-        # Validation Check
-        if "close" in result_df.columns:
-            print("❌ Error: Raw 'close' price still in dataset.")
-        else:
-            print("✅ Success: Raw prices removed.")
+    if PART_ID == 0:
+        print(f"\n--- [TEST MODE] Running on first 2 tickers only ---")
+        tickers_to_process = all_tickers[:2]
+    else:
+        if PART_ID > TOTAL_PARTS:
+            print(
+                f"Error: PART_ID ({PART_ID}) cannot be greater than TOTAL_PARTS ({TOTAL_PARTS})"
+            )
+            exit()
 
-        result_df.to_csv("feature_output_test.csv", index=False)
+        chunk_size = math.ceil(total_tickers / TOTAL_PARTS)
+        start_idx = (PART_ID - 1) * chunk_size
+        end_idx = min(start_idx + chunk_size, total_tickers)
+
+        tickers_to_process = all_tickers[start_idx:end_idx]
+        print(f"\n--- [PRODUCTION MODE] Processing Part {PART_ID}/{TOTAL_PARTS} ---")
+        print(
+            f"Processing index {start_idx} to {end_idx} ({len(tickers_to_process)} tickers)"
+        )
+
+    # 3. Process Global News
+    global_news_df = process_global_news()
+
+    # 4. Processing Loop
+    success_count = 0
+
+    for ticker in tqdm(tickers_to_process, desc="Processing Tickers"):
+        try:
+            raw_df = get_clean_ticker_data(ticker)
+            if raw_df.empty or len(raw_df) < 500:
+                continue
+
+            processed_df = add_features_and_clean(raw_df, global_news_df)
+            processed_df["ticker"] = ticker
+
+            save_path = os.path.join(OUTPUT_DIR, f"{ticker}.parquet")
+            processed_df.to_parquet(save_path, compression="snappy")
+
+            success_count += 1
+
+        except Exception as e:
+            print(f"Failed to process {ticker}: {e}")
+
+    print(
+        f"\nProcessing Complete! {success_count}/{len(tickers_to_process)} tickers saved to {OUTPUT_DIR}"
+    )
