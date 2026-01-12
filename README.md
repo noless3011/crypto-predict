@@ -1,16 +1,23 @@
-https://drive.google.com/drive/folders/1Ld1Y0o-MqnfT3azDq5bI3ucBKPcpy8H2?usp=sharing
+## Hướng dẫn chạy project
 
-vào drive này lấy models nhé
-xong bỏ vào thư mục models
+### 1. Tải model
+- Truy cập Google Drive:  
+  https://drive.google.com/drive/folders/1Ld1Y0o-MqnfT3azDq5bI3ucBKPcpy8H2?usp=sharing
+- Tải toàn bộ **models**
+- Copy và bỏ vào thư mục `models/` của project
 
-chạy thì 
+---
+
+### 2. Chạy Backend
+```bash
 pip install -r requirements.txt
 python backend/main.py
+```
+3. Chạy Frontend
 
-xong r mở 1 terminal khác lên chạy
-npm install 
+Mở terminal khác:
+```bash
+npm install
 npm run dev
-
-để chạy frontend
-
-ảnh trong evalualtion result
+```
+Ảnh kết quả training nằm trong thư mục evaluation result
