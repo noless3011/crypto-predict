@@ -13,7 +13,7 @@
 pip install -r requirements.txt
 python backend/main.py
 ```
-3. Chạy Frontend
+###3. Chạy Frontend
 
 Mở terminal khác:
 ```bash
