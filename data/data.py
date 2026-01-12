@@ -32,9 +32,16 @@ class ClickhouseHelper:
         return pd.DataFrame(rows, columns=columns)  # type: ignore
 
     @staticmethod
-    def find_ticker(ticker: str, csv_path: str = "ticker.csv", verbose: bool = False):
+    def find_ticker(
+        ticker: str, interval: Interval = Interval.FIVE_MINUTES, verbose: bool = False
+    ):
         try:
-            df = pd.read_csv(csv_path)
+            # Query database for list of tickers
+            df = ClickhouseHelper.list_ticker(interval=interval, verbose=False)
+            if df.empty:
+                print("No tickers found in database.")
+                return None
+
             tickers = df["ticker"].astype(str).tolist()
 
             # exact match
@@ -62,9 +69,6 @@ class ClickhouseHelper:
 
             return selected or None
 
-        except FileNotFoundError:
-            print(f"Error: {csv_path} not found.")
-            return None
         except Exception as e:
             print(f"An error occurred: {e}")
             return None
@@ -73,6 +77,59 @@ class ClickhouseHelper:
     def list_ticker(interval: Interval = Interval.FIVE_MINUTES, verbose: bool = False):
         query = f"SELECT DISTINCT ticker FROM future_kline_{interval.value}"
         return ClickhouseHelper.run_to_df(query, verbose=verbose)
+
+    @staticmethod
+    def get_latest_data(
+        ticker: str,
+        limit: int = 5000,
+        time_end: datetime | None = None,
+        interval: Interval = Interval.FIVE_MINUTES,
+        verbose: bool = False,
+    ):
+        """
+        Get the latest N rows of OHLCV data for a ticker, optionally up to a specific end time
+        This is more efficient than get_data_between when you just need recent data
+        """
+        conditions = [
+            f"ticker = '{ClickhouseHelper.find_ticker(ticker, interval=interval, verbose=verbose)}'"
+        ]
+
+        if time_end:
+            conditions.append(f"openTime <= {int(time_end.timestamp() * 1000)}")
+
+        query = f"""
+        SELECT openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, numOfTrades, takerBuyBaseAssetVolume
+        FROM future_kline_{interval.value}
+        WHERE {" AND ".join(conditions)}
+        ORDER BY openTime DESC
+        LIMIT {limit}
+        """
+
+        if verbose:
+            print(f"Fetching latest {limit} rows")
+            print(query)
+
+        df = ClickhouseHelper.run_to_df(query, verbose=verbose)
+
+        # Reverse to get chronological order (oldest to newest)
+        if not df.empty:
+            df = df.iloc[::-1].reset_index(drop=True)
+
+            # Convert Decimal types to float for numpy compatibility
+            numeric_columns = [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quoteAssetVolume",
+                "takerBuyBaseAssetVolume",
+            ]
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df
 
     @staticmethod
     def get_data_between(
@@ -87,7 +144,7 @@ class ClickhouseHelper:
         Get OHLCV data between a time range using chunked queries
         """
         conditions = [
-            f"ticker = '{ClickhouseHelper.find_ticker(ticker, verbose=verbose)}'"
+            f"ticker = '{ClickhouseHelper.find_ticker(ticker, interval=interval, verbose=verbose)}'"
         ]
         if time_start:
             conditions.append(f"openTime >= {int(time_start.timestamp() * 1000)}")
@@ -125,7 +182,23 @@ class ClickhouseHelper:
 
         # Combine all chunks
         if all_data:
-            return pd.concat(all_data, ignore_index=True)
+            df = pd.concat(all_data, ignore_index=True)
+
+            # Convert Decimal types to float for numpy compatibility
+            numeric_columns = [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quoteAssetVolume",
+                "takerBuyBaseAssetVolume",
+            ]
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            return df
         else:
             return pd.DataFrame()
 
@@ -133,10 +206,63 @@ class ClickhouseHelper:
     def get_news_between(
         time_start: datetime | None,
         time_end: datetime | None,
+        limit: int | None = None,
+        offset: int | None = None,
+        verbose: bool = False,
+        include_body: bool = False,  # Optional flag to include full article text
+    ):
+        """
+        Get news data between a time range with optional pagination
+        """
+        # Select only necessary columns to reduce data transfer
+        columns = [
+            "id",
+            "publishedOn",
+            "title",
+            "subtitle",
+            "sentiment",
+            "sourceName",
+            "categories",
+            "url",
+            "imageUrl",
+            "authors",
+            "keywords",
+            "guid",
+        ]
+
+        if include_body:
+            columns.append("rawBody")
+
+        conditions = []
+        if time_start:
+            conditions.append(f"publishedOn >= {int(time_start.timestamp())}")
+
+        if time_end:
+            conditions.append(f"publishedOn <= {int(time_end.timestamp())}")
+
+        query = f"""
+        SELECT {", ".join(columns)}
+        FROM news
+        {"WHERE " + " AND ".join(conditions) if conditions else ""}
+        ORDER BY publishedOn DESC
+        """
+
+        if limit is not None:
+            query += f" LIMIT {limit}"
+
+        if offset is not None:
+            query += f" OFFSET {offset}"
+
+        return ClickhouseHelper.run_to_df(query, verbose=verbose)
+
+    @staticmethod
+    def get_news_count(
+        time_start: datetime | None,
+        time_end: datetime | None,
         verbose: bool = False,
     ):
         """
-        Get news data between a time range
+        Get count of news items between a time range
         """
         conditions = []
         if time_start:
@@ -146,13 +272,17 @@ class ClickhouseHelper:
             conditions.append(f"publishedOn <= {int(time_end.timestamp())}")
 
         query = f"""
-        SELECT publishedOn, sentiment, keywords
+        SELECT COUNT(*) as count
         FROM news
         {"WHERE " + " AND ".join(conditions) if conditions else ""}
-        ORDER BY publishedOn
         """
 
-        return ClickhouseHelper.run_to_df(query, verbose=verbose)
+        df = ClickhouseHelper.run_to_df(query, verbose=verbose)
+        if not df.empty:
+            count = df.iloc[0]["count"]
+            # Convert numpy type to native Python int for JSON serialization
+            return int(count) if count is not None else 0
+        return 0
 
 
 if __name__ == "__main__":
