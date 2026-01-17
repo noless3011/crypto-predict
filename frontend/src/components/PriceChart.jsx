@@ -163,15 +163,90 @@ const PriceChart = ({ startTime, endTime, shouldLoad }) => {
       candleSeries.setData(data);
     }
 
-    // Prediction Series
+    // Prediction Series - Enhanced with better visual styling
     if (prediction && prediction.length > 0) {
-      const predSeries = chart.addLineSeries({
-        color: "#facc15", // Yellow
-        lineWidth: 2,
-        lineStyle: 0, // Solid
-        title: "Prediction",
+      // Add a line series for smooth prediction path
+      const predLineSeries = chart.addLineSeries({
+        color: "#fbbf24",
+        lineWidth: 3,
+        lineStyle: 0,
+        crosshairMarkerVisible: true,
+        crosshairMarkerRadius: 6,
+        crosshairMarkerBorderColor: "#fbbf24",
+        crosshairMarkerBackgroundColor: "#1e293b",
+        lastValueVisible: true,
+        priceLineVisible: true,
+        priceLineColor: "#fbbf24",
+        priceLineWidth: 1,
+        priceLineStyle: 2,
       });
-      predSeries.setData(prediction);
+
+      // Convert to line data
+      const predLineData = prediction.map((p) => ({
+        time: p.time,
+        value: p.value,
+      }));
+
+      predLineSeries.setData(predLineData);
+
+      // Add candlestick series with faint red/green colors
+      const predSeries = chart.addCandlestickSeries({
+        upColor: "rgba(34, 197, 94, 0.2)", // Faint green with low transparency
+        downColor: "rgba(239, 68, 68, 0.2)", // Faint red with low transparency
+        borderVisible: true,
+        borderUpColor: "rgba(34, 197, 94, 0.4)", // Faint green border
+        borderDownColor: "rgba(239, 68, 68, 0.4)", // Faint red border
+        wickUpColor: "rgba(34, 197, 94, 0.5)",
+        wickDownColor: "rgba(239, 68, 68, 0.5)",
+        wickVisible: true,
+      });
+
+      // Create candlestick format with proper continuity
+      // Each candle's open = previous candle's close
+      const predCandleData = prediction.map((p, index) => {
+        let open;
+        const close = p.value;
+
+        if (index === 0) {
+          // First prediction candle: open = last historical close
+          open = data.length > 0 ? data[data.length - 1].close : p.value;
+        } else {
+          // Subsequent candles: open = previous prediction close
+          open = prediction[index - 1].value;
+        }
+
+        // Calculate high and low with small variation for visibility
+        const variation =
+          Math.abs(close - open) * 0.5 || Math.abs(close) * 0.002;
+        const high = Math.max(open, close) + variation;
+        const low = Math.min(open, close) - variation;
+
+        return {
+          time: p.time,
+          open: open,
+          high: high,
+          low: low,
+          close: close,
+        };
+      });
+
+      predSeries.setData(predCandleData);
+
+      // Add markers for prediction start
+      if (data.length > 0 && prediction.length > 0) {
+        const lastHistoricalTime = data[data.length - 1].time;
+        const firstPredictionTime = prediction[0].time;
+
+        predLineSeries.setMarkers([
+          {
+            time: firstPredictionTime,
+            position: "inBar",
+            color: "#fbbf24",
+            shape: "circle",
+            text: "Prediction Start",
+          },
+        ]);
+      }
     }
 
     // Resize handler

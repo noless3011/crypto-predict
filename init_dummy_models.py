@@ -1,37 +1,43 @@
-
 import os
+
+import joblib
 import numpy as np
 import tensorflow as tf
-import joblib
 from sklearn.preprocessing import RobustScaler
 
 # Configuration
-SAVE_DIR = os.path.join('models')
+SAVE_DIR = os.path.join("models")
 N_STEPS_IN = 36
 N_STEPS_OUT = 5
 # Features calculated:
 # Base: Open, High, Low (3)
 # Indicators: RSI(1), MACD(2), MA(3), BB(4), ATR(1), ROC(1)
 # Total Features = 3 + 12 = 15
-N_FEATURES_INPUT = 15 
+N_FEATURES_INPUT = 15
 # Total Columns for Scaler = 1 (Close) + 15 (Features) = 16
-N_TOTAL_COLS = 16 
+N_TOTAL_COLS = 16
 
 MODEL_NAMES = [
-    'LSTM', 
-    'BD LSTM', 
-    'ED LSTM', 
-    'CNN', 
-    'Convolutional LSTM', 
-    'MLP', 
-    'Transformer'
+    "LSTM",
+    "BD LSTM",
+    "ED LSTM",
+    "CNN",
+    "Convolutional LSTM",
+    "MLP",
+    "Transformer",
 ]
 
 
 class IdentityScaler:
-    def fit(self, x): return self
-    def transform(self, x): return x
-    def inverse_transform(self, x): return x
+    def fit(self, x):
+        return self
+
+    def transform(self, x):
+        return x
+
+    def inverse_transform(self, x):
+        return x
+
 
 def create_dummy_model(name):
     """
@@ -45,9 +51,7 @@ def create_dummy_model(name):
 
         # random percentage in [0.0001, 0.001]
         rand_pct = tf.random.uniform(
-            shape=tf.shape(current_price),
-            minval=0.0001,
-            maxval=0.001
+            shape=tf.shape(current_price), minval=0.0001, maxval=0.001
         )
 
         # randomly choose + or -
@@ -59,13 +63,16 @@ def create_dummy_model(name):
         # repeat for N_STEPS_OUT
         return tf.tile(noisy_price, [1, N_STEPS_OUT])
 
-    model = tf.keras.models.Sequential([
-        tf.keras.layers.Input(shape=(N_STEPS_IN, N_FEATURES_INPUT)),
-        tf.keras.layers.Lambda(price_with_noise)
-    ])
+    model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.Input(shape=(N_STEPS_IN, N_FEATURES_INPUT)),
+            tf.keras.layers.Lambda(price_with_noise),
+        ]
+    )
 
-    model.compile(optimizer='adam', loss='mse')
+    model.compile(optimizer="adam", loss="mse")
     return model
+
 
 def create_dummy_scalers():
     scalers = {}
@@ -87,14 +94,14 @@ def main():
         print(f"Created directory: {SAVE_DIR}")
 
     print(f"Initializing dummy models in {SAVE_DIR}...")
-    
+
     for name in MODEL_NAMES:
         clean_name = name.replace(" ", "_")
-        
+
         # Paths
-        model_path = os.path.join(SAVE_DIR, f"{clean_name}_r1.keras")
-        scaler_path = os.path.join(SAVE_DIR, f"{clean_name}_r1_scaler.pkl")
-        
+        model_path = os.path.join(SAVE_DIR, f"{clean_name}_r_0.keras")
+        scaler_path = os.path.join(SAVE_DIR, f"{clean_name}_r_0_scaler.pkl")
+
         # 1. Create and Save Model
         if not os.path.exists(model_path):
             model = create_dummy_model(name)
@@ -102,7 +109,7 @@ def main():
             print(f"  [+] Created model: {model_path}")
         else:
             print(f"  [.] Model exists: {model_path}")
-            
+
         # 2. Create and Save Scaler
         if not os.path.exists(scaler_path):
             scalers = create_dummy_scalers()
@@ -112,6 +119,7 @@ def main():
             print(f"  [.] Scalers exist: {scaler_path}")
 
     print("\nDone! Dummy models are ready for testing.")
+
 
 if __name__ == "__main__":
     main()
